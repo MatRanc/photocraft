@@ -110,11 +110,14 @@ fn rect_from(a: [f64; 2], b: [f64; 2]) -> photocraft_geom::Rect {
     photocraft_geom::Rect::new(x0, y0, x1, y1)
 }
 
-/// Where a new slice drawn from `start` to `cur` ends under the Slice tool's Style (Normal, Fixed
-/// Ratio, Fixed Size), as the marquee's (#8360).
-fn new_end(app: &PhotocraftApp, start: [f64; 2], cur: [f64; 2]) -> [f64; 2] {
+/// The new slice drawn from `start` to `cur` under the Slice tool's Style (Normal, Fixed Ratio,
+/// Fixed Size), as the marquee's (#8360). Fixed Size starts on the pixel the press is in, so the
+/// slice has exactly that many pixels.
+fn new_rect(app: &PhotocraftApp, start: [f64; 2], cur: [f64; 2]) -> photocraft_geom::Rect {
     let o = &app.ui.tool_options;
-    crate::chrome_ui::marquee_end(&o.slice_style, f64::from(o.slice_width), f64::from(o.slice_height), false, start, cur)
+    let start = if o.slice_style == "fixedSize" { start.map(f64::floor) } else { start };
+    let (w, h) = (f64::from(o.slice_width), f64::from(o.slice_height));
+    rect_from(start, crate::chrome_ui::marquee_end(&o.slice_style, w, h, false, start, cur))
 }
 
 /// Pointer input for the two slice tools. Returns true when the event was theirs.
@@ -163,8 +166,11 @@ pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, _mods: egui::Modifiers) -
         },
         ToolEvent::Up { x, y } => match app.ui.slices.drag.take() {
             Some(SliceDrag::New { start, .. }) => {
-                let r = rect_from(start, new_end(app, start, [x, y]));
-                if r.width() >= 1 && r.height() >= 1 && (r.width() > 2 || r.height() > 2) {
+                let r = new_rect(app, start, [x, y]);
+                // A drag of a pixel or two is a click, which selects; a Fixed Size slice is made
+                // by a click, at any size.
+                let fixed_size = app.ui.tool_options.slice_style == "fixedSize";
+                if r.width() >= 1 && r.height() >= 1 && (fixed_size || r.width() > 2 || r.height() > 2) {
                     if let Ok(v) = app.run("slice.new", json!({"rect": [r.x0, r.y0, r.width(), r.height()]})) {
                         app.ui.slices.selected = v.get("number").and_then(Value::as_u64).map(|n| n as usize);
                     }
@@ -270,7 +276,7 @@ pub fn draw_overlay(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform
     }
     match &app.ui.slices.drag {
         Some(SliceDrag::New { start, cur }) => {
-            let sr = to_screen(rect_from(*start, new_end(app, *start, *cur)));
+            let sr = to_screen(new_rect(app, *start, *cur));
             painter.rect_stroke(sr, 0.0, Stroke::new(1.0, Color32::WHITE), egui::StrokeKind::Middle);
             let pts = [sr.left_top(), sr.right_top(), sr.right_bottom(), sr.left_bottom(), sr.left_top()];
             painter.add(egui::Shape::dashed_line(&pts, Stroke::new(1.0, color), 4.0, 4.0));
@@ -492,7 +498,15 @@ mod tests {
         pointer(&mut app, ToolEvent::Down { x: 40.0, y: 40.0, pressure: 1.0 }, m);
         pointer(&mut app, ToolEvent::Move { x: 41.0, y: 41.0, pressure: 1.0 }, m);
         let Some(SliceDrag::New { start, cur }) = app.ui.slices.drag.clone() else { panic!("drawing a slice") };
-        assert_eq!(rect_from(start, new_end(&app, start, cur)), photocraft_geom::Rect::new(40, 40, 64, 56));
+        assert_eq!(new_rect(&app, start, cur), photocraft_geom::Rect::new(40, 40, 64, 56));
+        pointer(&mut app, ToolEvent::Up { x: 41.0, y: 41.0 }, m);
+        // A press inside a pixel starts the slice on that pixel, still 24 x 16 pixels.
+        assert_eq!(draw(&mut app, [10.25, 30.75], [12.5, 31.5]), photocraft_geom::Rect::new(10, 30, 34, 46), "a press inside a pixel");
+        assert_eq!(draw(&mut app, [70.5, 70.5], [60.25, 60.25]), photocraft_geom::Rect::new(46, 54, 70, 70), "and towards the upper left");
+        // A size of a pixel or two is made too, not taken for a click that selects.
+        let o = &mut app.ui.tool_options;
+        (o.slice_width, o.slice_height) = (1.0, 2.0);
+        assert_eq!(draw(&mut app, [3.0, 3.0], [3.0, 3.0]), photocraft_geom::Rect::new(3, 3, 4, 5), "a 1 x 2 slice");
     }
 
     /// #8360: the options bar's Style picks Fixed Size, which starts at 64 × 64 px, and the slice

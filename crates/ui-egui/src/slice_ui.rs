@@ -111,13 +111,37 @@ fn rect_from(a: [f64; 2], b: [f64; 2]) -> photocraft_geom::Rect {
 }
 
 /// The new slice drawn from `start` to `cur` under the Slice tool's Style (Normal, Fixed Ratio,
-/// Fixed Size), as the marquee's (#8360). Fixed Size starts on the pixel the press is in, so the
-/// slice has exactly that many pixels.
+/// Fixed Size), as the marquee's (#8360). A fixed style starts on the pixel the press is in and
+/// takes both sides from one scale, so Fixed Size has exactly its pixels and a whole-number Fixed
+/// Ratio (2 : 1, 16 : 9) exactly its ratio: rounding each edge of a fractional drag apart would
+/// make 2 : 1 into 3 × 2.
 fn new_rect(app: &PhotocraftApp, start: [f64; 2], cur: [f64; 2]) -> photocraft_geom::Rect {
     let o = &app.ui.tool_options;
-    let start = if o.slice_style == "fixedSize" { start.map(f64::floor) } else { start };
     let (w, h) = (f64::from(o.slice_width), f64::from(o.slice_height));
-    rect_from(start, crate::chrome_ui::marquee_end(&o.slice_style, w, h, false, start, cur))
+    let size = match o.slice_style.as_str() {
+        "fixedSize" => [w.round().max(1.0), h.round().max(1.0)],
+        "fixedRatio" if w > 0.0 && h > 0.0 => {
+            let start = start.map(f64::floor);
+            let end = crate::chrome_ui::marquee_end("fixedRatio", w, h, false, start, cur);
+            let k = (end[0] - start[0]).abs() / w;
+            if w.fract() == 0.0 && h.fract() == 0.0 {
+                // Whole multiples of the ratio in its lowest terms.
+                let g = gcd(w as u64, h as u64) as f64;
+                let n = (k * g).round();
+                [n * w / g, n * h / g]
+            } else {
+                [(k * w).round(), (k * h).round()]
+            }
+        }
+        _ => return rect_from(start, crate::chrome_ui::marquee_end(&o.slice_style, w, h, false, start, cur)),
+    };
+    let start = start.map(f64::floor);
+    let sign = |d: f64| if d < 0.0 { -1.0 } else { 1.0 };
+    rect_from(start, [start[0] + sign(cur[0] - start[0]) * size[0], start[1] + sign(cur[1] - start[1]) * size[1]])
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a.max(1) } else { gcd(b, a % b) }
 }
 
 /// Pointer input for the two slice tools. Returns true when the event was theirs.
@@ -359,12 +383,17 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
         let (range, unit) = (crate::tool_memory::style_range(&o.slice_style), if fixed_size { "px" } else { "" });
         ui.add_enabled_ui(o.slice_style != "normal", |ui| {
             crate::panels::opt_label(ui, tl!("Width"));
-            crate::widgets::value_field(ui, &mut o.slice_width, range.clone(), unit, 62.0);
+            // Fixed Size is whole pixels, as the slice it makes.
+            if crate::widgets::value_field(ui, &mut o.slice_width, range.clone(), unit, 62.0).changed() && fixed_size {
+                o.slice_width = o.slice_width.round();
+            }
             if crate::icons::button(ui, "arrow-left-right", 22.0, false, tl!("Swaps height and width")).clicked() {
                 std::mem::swap(&mut o.slice_width, &mut o.slice_height);
             }
             crate::panels::opt_label(ui, tl!("Height"));
-            crate::widgets::value_field(ui, &mut o.slice_height, range, unit, 62.0);
+            if crate::widgets::value_field(ui, &mut o.slice_height, range, unit, 62.0).changed() && fixed_size {
+                o.slice_height = o.slice_height.round();
+            }
         });
         crate::widgets::vline(ui, 22.0);
         if ui.add_enabled_ui(has_doc && !locked, |ui| crate::widgets::secondary_button(ui, tl!("Slices From Guides"), 0.0)).inner.clicked() {
@@ -503,10 +532,36 @@ mod tests {
         // A press inside a pixel starts the slice on that pixel, still 24 x 16 pixels.
         assert_eq!(draw(&mut app, [10.25, 30.75], [12.5, 31.5]), photocraft_geom::Rect::new(10, 30, 34, 46), "a press inside a pixel");
         assert_eq!(draw(&mut app, [70.5, 70.5], [60.25, 60.25]), photocraft_geom::Rect::new(46, 54, 70, 70), "and towards the upper left");
+        // A Fixed Size that isn't whole pixels (from a settings file) is rounded, not grown a pixel.
+        let o = &mut app.ui.tool_options;
+        (o.slice_width, o.slice_height) = (1.5, 2.4);
+        assert_eq!(draw(&mut app, [5.5, 5.5], [5.5, 5.5]), photocraft_geom::Rect::new(5, 5, 7, 7), "1.5 x 2.4 is 2 x 2");
         // A size of a pixel or two is made too, not taken for a click that selects.
         let o = &mut app.ui.tool_options;
         (o.slice_width, o.slice_height) = (1.0, 2.0);
         assert_eq!(draw(&mut app, [3.0, 3.0], [3.0, 3.0]), photocraft_geom::Rect::new(3, 3, 4, 5), "a 1 x 2 slice");
+    }
+
+    /// #8360: a fractional drag keeps a whole-number Fixed Ratio exactly, in whole multiples of it
+    /// in its lowest terms; any other ratio comes as close as whole pixels allow.
+    #[test]
+    fn fixed_ratio_slices_keep_their_ratio_from_a_fractional_drag() {
+        let mut app = app();
+        app.ui.tool = Tool::Slice;
+        let m = egui::Modifiers::NONE;
+        let mut draw = |w: f32, h: f32, a: [f64; 2], b: [f64; 2]| {
+            let o = &mut app.ui.tool_options;
+            (o.slice_style, o.slice_width, o.slice_height) = ("fixedRatio".into(), w, h);
+            pointer(&mut app, ToolEvent::Down { x: a[0], y: a[1], pressure: 1.0 }, m);
+            pointer(&mut app, ToolEvent::Up { x: b[0], y: b[1] }, m);
+            let r = app.session.active().unwrap().doc.slices.list.last().unwrap().rect;
+            (r.x0, r.y0, r.width(), r.height())
+        };
+        assert_eq!(draw(2.0, 1.0, [10.5, 10.5], [14.5, 11.0]), (10, 10, 4, 2), "not 5 x 2");
+        assert_eq!(draw(2.0, 1.0, [10.5, 10.5], [31.3, 13.0]), (10, 10, 22, 11));
+        assert_eq!(draw(16.0, 9.0, [0.5, 0.5], [40.3, 10.0]), (0, 0, 48, 27), "the nearest multiple, 2.52 x 16 : 9");
+        assert_eq!(draw(4.0, 2.0, [60.7, 60.7], [50.2, 58.0]), (50, 55, 10, 5), "4 : 2 is 2 : 1, towards the upper left");
+        assert_eq!(draw(1.5, 1.0, [0.0, 40.0], [30.0, 41.0]), (0, 40, 30, 20), "a fractional ratio");
     }
 
     /// #8360: the options bar's Style picks Fixed Size, which starts at 64 × 64 px, and the slice

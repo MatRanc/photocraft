@@ -1690,7 +1690,7 @@ pub(crate) fn opt_label(ui: &mut egui::Ui, s: &str) {
 }
 
 /// The largest Fixed Size side, in pixels.
-const FIXED_SIZE_MAX_PX: f64 = 300_000.0;
+pub(crate) const FIXED_SIZE_MAX_PX: f64 = 300_000.0;
 
 /// The resolution Fixed Size's units convert at (the active document's, 72 ppi without one) and
 /// the document's size in pixels, which a percentage is of. The unit is the caller's.

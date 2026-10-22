@@ -111,37 +111,41 @@ fn rect_from(a: [f64; 2], b: [f64; 2]) -> photocraft_geom::Rect {
 }
 
 /// The new slice drawn from `start` to `cur` under the Slice tool's Style (Normal, Fixed Ratio,
-/// Fixed Size), as the marquee's (#8360). A fixed style starts on the pixel the press is in and
-/// takes both sides from one scale, so Fixed Size has exactly its pixels and a whole-number Fixed
-/// Ratio (2 : 1, 16 : 9) exactly its ratio: rounding each edge of a fractional drag apart would
-/// make 2 : 1 into 3 × 2.
+/// Fixed Size), as the marquee's (#8360). A fixed style is placed on the pixel the press is in.
+/// Fixed Size has exactly its pixels. Fixed Ratio's longer side follows the drag to within a pixel
+/// and the shorter side takes the ratio from it, as close as whole pixels allow: rounding each edge of
+/// a fractional drag apart would make 2 : 1 into 5 × 3, and keeping to whole multiples of the
+/// ratio would grow a 1366 : 768 slice in steps of 683 px.
 fn new_rect(app: &PhotocraftApp, start: [f64; 2], cur: [f64; 2]) -> photocraft_geom::Rect {
     let o = &app.ui.tool_options;
     let (w, h) = (f64::from(o.slice_width), f64::from(o.slice_height));
     let size = match o.slice_style.as_str() {
         "fixedSize" => [w.round().max(1.0), h.round().max(1.0)],
         "fixedRatio" if w > 0.0 && h > 0.0 => {
-            let start = start.map(f64::floor);
             let end = crate::chrome_ui::marquee_end("fixedRatio", w, h, false, start, cur);
             let k = (end[0] - start[0]).abs() / w;
-            if w.fract() == 0.0 && h.fract() == 0.0 {
-                // Whole multiples of the ratio in its lowest terms.
-                let g = gcd(w as u64, h as u64) as f64;
-                let n = (k * g).round();
-                [n * w / g, n * h / g]
+            // A drag shorter than half a pixel is a click: no size.
+            let follow = |long: f64, short: f64| {
+                let l = (k * long).round();
+                [l, if l > 0.0 { (l * short / long).round().max(1.0) } else { 0.0 }]
+            };
+            if w >= h {
+                follow(w, h)
             } else {
-                [(k * w).round(), (k * h).round()]
+                let [l, s] = follow(h, w);
+                [s, l]
             }
         }
         _ => return rect_from(start, crate::chrome_ui::marquee_end(&o.slice_style, w, h, false, start, cur)),
     };
-    let start = start.map(f64::floor);
+    // The drag's extent and direction are from the press itself; only the slice is placed on the
+    // pixel the press is in.
     let sign = |d: f64| if d < 0.0 { -1.0 } else { 1.0 };
-    rect_from(start, [start[0] + sign(cur[0] - start[0]) * size[0], start[1] + sign(cur[1] - start[1]) * size[1]])
-}
-
-fn gcd(a: u64, b: u64) -> u64 {
-    if b == 0 { a.max(1) } else { gcd(b, a % b) }
+    // A slice drawn left or up grows from the far side of that pixel, so it holds the pixel: the
+    // edges a Normal slice gets from the same press (`rect_from`), also on a pixel's edge.
+    let dir = [sign(cur[0] - start[0]), sign(cur[1] - start[1])];
+    let corner = [0, 1].map(|i| if dir[i] < 0.0 { start[i].ceil() } else { start[i].floor() });
+    rect_from(corner, [corner[0] + dir[0] * size[0], corner[1] + dir[1] * size[1]])
 }
 
 /// Pointer input for the two slice tools. Returns true when the event was theirs.
@@ -380,20 +384,24 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
             (o.slice_width, o.slice_height) = if o.slice_style == "fixedSize" { (64.0, 64.0) } else { (1.0, 1.0) };
         }
         let fixed_size = o.slice_style == "fixedSize";
-        let (range, unit) = (crate::tool_memory::style_range(&o.slice_style), if fixed_size { "px" } else { "" });
+        let range = crate::tool_memory::style_range(&o.slice_style);
+        // Fixed Size shows whole pixels, the size the slice gets (`new_rect` rounds the same way),
+        // however the value was typed, stepped or scrubbed.
+        let field = |ui: &mut egui::Ui, v: &mut f32| {
+            if fixed_size {
+                crate::widgets::value_field_prec(ui, v, range.clone(), "px", 62.0, 0)
+            } else {
+                crate::widgets::value_field(ui, v, range.clone(), "", 62.0)
+            }
+        };
         ui.add_enabled_ui(o.slice_style != "normal", |ui| {
             crate::panels::opt_label(ui, tl!("Width"));
-            // Fixed Size is whole pixels, as the slice it makes.
-            if crate::widgets::value_field(ui, &mut o.slice_width, range.clone(), unit, 62.0).changed() && fixed_size {
-                o.slice_width = o.slice_width.round();
-            }
+            field(ui, &mut o.slice_width);
             if crate::icons::button(ui, "arrow-left-right", 22.0, false, tl!("Swaps height and width")).clicked() {
                 std::mem::swap(&mut o.slice_width, &mut o.slice_height);
             }
             crate::panels::opt_label(ui, tl!("Height"));
-            if crate::widgets::value_field(ui, &mut o.slice_height, range, unit, 62.0).changed() && fixed_size {
-                o.slice_height = o.slice_height.round();
-            }
+            field(ui, &mut o.slice_height);
         });
         crate::widgets::vline(ui, 22.0);
         if ui.add_enabled_ui(has_doc && !locked, |ui| crate::widgets::secondary_button(ui, tl!("Slices From Guides"), 0.0)).inner.clicked() {
@@ -531,7 +539,13 @@ mod tests {
         pointer(&mut app, ToolEvent::Up { x: 41.0, y: 41.0 }, m);
         // A press inside a pixel starts the slice on that pixel, still 24 x 16 pixels.
         assert_eq!(draw(&mut app, [10.25, 30.75], [12.5, 31.5]), photocraft_geom::Rect::new(10, 30, 34, 46), "a press inside a pixel");
-        assert_eq!(draw(&mut app, [70.5, 70.5], [60.25, 60.25]), photocraft_geom::Rect::new(46, 54, 70, 70), "and towards the upper left");
+        assert_eq!(
+            draw(&mut app, [70.5, 70.5], [60.25, 60.25]),
+            photocraft_geom::Rect::new(47, 55, 71, 71),
+            "and towards the upper left, holding the pressed pixel"
+        );
+        // A short drag up and to the left inside the pressed pixel goes up and to the left.
+        assert_eq!(draw(&mut app, [50.75, 50.75], [50.25, 50.25]), photocraft_geom::Rect::new(27, 35, 51, 51), "up-left within the pixel");
         // A Fixed Size that isn't whole pixels (from a settings file) is rounded, not grown a pixel.
         let o = &mut app.ui.tool_options;
         (o.slice_width, o.slice_height) = (1.5, 2.4);
@@ -542,8 +556,8 @@ mod tests {
         assert_eq!(draw(&mut app, [3.0, 3.0], [3.0, 3.0]), photocraft_geom::Rect::new(3, 3, 4, 5), "a 1 x 2 slice");
     }
 
-    /// #8360: a fractional drag keeps a whole-number Fixed Ratio exactly, in whole multiples of it
-    /// in its lowest terms; any other ratio comes as close as whole pixels allow.
+    /// #8360: Fixed Ratio's longer side follows a fractional drag to the pixel and the shorter takes
+    /// the ratio from it, as close as whole pixels allow.
     #[test]
     fn fixed_ratio_slices_keep_their_ratio_from_a_fractional_drag() {
         let mut app = app();
@@ -558,10 +572,33 @@ mod tests {
             (r.x0, r.y0, r.width(), r.height())
         };
         assert_eq!(draw(2.0, 1.0, [10.5, 10.5], [14.5, 11.0]), (10, 10, 4, 2), "not 5 x 2");
-        assert_eq!(draw(2.0, 1.0, [10.5, 10.5], [31.3, 13.0]), (10, 10, 22, 11));
-        assert_eq!(draw(16.0, 9.0, [0.5, 0.5], [40.3, 10.0]), (0, 0, 48, 27), "the nearest multiple, 2.52 x 16 : 9");
-        assert_eq!(draw(4.0, 2.0, [60.7, 60.7], [50.2, 58.0]), (50, 55, 10, 5), "4 : 2 is 2 : 1, towards the upper left");
+        assert_eq!(draw(2.0, 1.0, [10.5, 10.5], [31.3, 13.0]), (10, 10, 21, 11), "a 20.8 px drag: 21 px, and half of it as near as pixels allow");
+        assert_eq!(draw(16.0, 9.0, [0.5, 0.5], [40.3, 10.0]), (0, 0, 40, 23), "a 39.8 px drag");
+        assert_eq!(draw(1366.0, 768.0, [0.0, 0.0], [40.0, 1.0]), (0, 0, 40, 22), "not in steps of 683 px");
+        assert_eq!(draw(9.0, 16.0, [0.0, 0.0], [1.0, 32.2]), (0, 0, 18, 32), "the longer side is the height");
+        assert_eq!(draw(4.0, 2.0, [60.7, 60.7], [50.2, 58.0]), (50, 55, 11, 6), "towards the upper left, holding the pressed pixel");
         assert_eq!(draw(1.5, 1.0, [0.0, 40.0], [30.0, 41.0]), (0, 40, 30, 20), "a fractional ratio");
+        // A click inside a pixel doesn't move the pointer: it selects, as with Normal, and makes no
+        // slice (the drag is measured from the press, not from the pixel's corner).
+        let n = app.session.active().unwrap().doc.slices.list.len();
+        let o = &mut app.ui.tool_options;
+        (o.slice_width, o.slice_height) = (4.0, 1.0);
+        pointer(&mut app, ToolEvent::Down { x: 10.75, y: 10.75, pressure: 1.0 }, m);
+        pointer(&mut app, ToolEvent::Up { x: 10.75, y: 10.75 }, m);
+        assert_eq!(app.session.active().unwrap().doc.slices.list.len(), n, "a click makes no slice");
+    }
+
+    /// #8360: remembered Slice tool options are checked when loaded: an unknown Style is Normal
+    /// again, and Fixed Size is whole pixels.
+    #[test]
+    fn remembered_slice_options_are_checked() {
+        let mut o = crate::state::ToolOptions::default();
+        (o.slice_style, o.slice_width, o.slice_height) = ("fixedsize".into(), 0.5, 2.0);
+        crate::tool_memory::sanitize(&mut o);
+        assert_eq!(o.slice_style, "normal");
+        (o.slice_style, o.slice_width, o.slice_height) = ("fixedSize".into(), 1.5, 63.6);
+        crate::tool_memory::sanitize(&mut o);
+        assert_eq!((o.slice_width, o.slice_height), (2.0, 64.0));
     }
 
     /// #8360: the options bar's Style picks Fixed Size, which starts at 64 × 64 px, and the slice

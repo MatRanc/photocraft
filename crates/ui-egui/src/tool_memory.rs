@@ -201,7 +201,7 @@ pub fn restore(app: &mut PhotocraftApp) {
 /// The values Width and Height take under a marquee or Slice tool Style: a size in px for Fixed
 /// Size, else a ratio.
 pub(crate) fn style_range(style: &str) -> std::ops::RangeInclusive<f32> {
-    if style == "fixedSize" { 1.0..=300_000.0 } else { 0.001..=999.0 }
+    if style == "fixedSize" { 1.0..=crate::panels::FIXED_SIZE_MAX_PX as f32 } else { 0.001..=999.0 }
 }
 
 /// Bring remembered options into the ranges their options-bar fields allow, so a hand-edited or
@@ -232,9 +232,15 @@ pub(crate) fn sanitize(o: &mut ToolOptions) {
     let (lo, hi) = style_range(&o.marquee_style).into_inner();
     fit(&mut o.marquee_width, lo, hi, d.marquee_width);
     fit(&mut o.marquee_height, lo, hi, d.marquee_height);
+    if !matches!(o.slice_style.as_str(), "normal" | "fixedRatio" | "fixedSize") {
+        o.slice_style = d.slice_style.clone();
+    }
     let (lo, hi) = style_range(&o.slice_style).into_inner();
     fit(&mut o.slice_width, lo, hi, d.slice_width);
     fit(&mut o.slice_height, lo, hi, d.slice_height);
+    if o.slice_style == "fixedSize" {
+        (o.slice_width, o.slice_height) = (o.slice_width.round(), o.slice_height.round());
+    }
     fit(&mut o.crop_custom_ratio_width, 0.0, f32::MAX, d.crop_custom_ratio_width);
     fit(&mut o.crop_custom_ratio_height, 0.0, f32::MAX, d.crop_custom_ratio_height);
     fit(&mut o.magic_eraser_opacity, 1.0, 100.0, d.magic_eraser_opacity);
